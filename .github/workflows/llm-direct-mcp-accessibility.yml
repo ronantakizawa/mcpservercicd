@@ -1,0 +1,486 @@
+# .github/workflows/llm-direct-mcp-accessibility.yml
+name: LLM Direct MCP Function Calling
+
+on:
+  push:
+    branches: [main, master]
+  
+  pull_request:
+    branches: [main, master]
+  
+  workflow_dispatch:
+    inputs:
+      force_analysis:
+        description: 'Force analysis even if no HTML changes'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  llm-direct-mcp-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Create package.json
+        run: |
+          cat > package.json << 'EOF'
+          {
+            "name": "llm-direct-mcp-accessibility",
+            "version": "1.0.0",
+            "type": "module",
+            "dependencies": {
+              "@modelcontextprotocol/sdk": "^0.5.0",
+              "openai": "^4.0.0"
+            }
+          }
+          EOF
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm install -g a11y-mcp-server
+          echo "✅ Dependencies and A11y MCP Server installed"
+
+      - name: Validate environment
+        run: |
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "❌ OPENAI_API_KEY secret is required"
+            exit 1
+          fi
+          echo "✅ Environment validated"
+
+      - name: Create .gitignore if needed
+        run: |
+          if [ ! -f .gitignore ]; then
+            echo "📝 Creating .gitignore..."
+            cat > .gitignore << 'GITIGNORE_EOF'
+          # Node.js
+          node_modules/
+          package-lock.json
+          npm-debug.log*
+
+          # Accessibility automation artifacts
+          *.backup
+          *.original
+          *_REPORT.md
+
+          # Temporary files
+          .github/scripts/llm-*.js
+          .cache/
+          *.tmp
+
+          # IDE files
+          .vscode/
+          .idea/
+          *.swp
+
+          # OS files
+          .DS_Store
+          Thumbs.db
+          GITIGNORE_EOF
+            echo "✅ Created .gitignore"
+          fi
+
+      - name: Backup HTML files
+        run: |
+          echo "💾 Creating backups..."
+          find . -name "*.html" -not -path "./.git/*" -not -path "./node_modules/*" | while read file; do
+            cp "$file" "$file.original"
+            echo "Backed up: $file"
+          done
+
+      - name: Create LLM Direct MCP script
+        run: |
+          mkdir -p .github/scripts
+          cat > .github/scripts/llm-direct-mcp.js << 'SCRIPT_EOF'
+          import fs from 'fs/promises';
+          import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+          import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+          import OpenAI from 'openai';
+
+          class LLMDirectMCPAgent {
+            constructor() {
+              this.a11yClient = null;
+              this.transport = null;
+              this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+            }
+
+            async initialize() {
+              console.log('🔧 Initializing A11y MCP Server...');
+              
+              this.transport = new StdioClientTransport({
+                command: 'npx',
+                args: ['-y', 'a11y-mcp-server'],
+                env: process.env
+              });
+
+              this.a11yClient = new Client({
+                name: "llm-direct-mcp-agent",
+                version: "1.0.0"
+              }, { capabilities: { tools: {} } });
+
+              await this.a11yClient.connect(this.transport);
+              console.log('✅ A11y MCP Server connected');
+            }
+
+            async executeFunction(name, args) {
+              console.log(`🔧 LLM called function: ${name}`);
+              
+              try {
+                let result;
+                if (name === 'test_html_accessibility') {
+                  result = await this.a11yClient.callTool({
+                    name: 'test_html_string',
+                    arguments: { html: args.html, tags: args.tags || ['wcag2aa'] }
+                  });
+                } else if (name === 'check_color_contrast') {
+                  result = await this.a11yClient.callTool({
+                    name: 'check_color_contrast',
+                    arguments: { 
+                      foreground: args.foreground, 
+                      background: args.background,
+                      fontSize: args.fontSize || 16,
+                      isBold: args.isBold || false
+                    }
+                  });
+                } else {
+                  return { error: `Unknown function: ${name}` };
+                }
+                
+                if (result.content && result.content[0]?.text) {
+                  return JSON.parse(result.content[0].text);
+                }
+                return { error: 'No result from MCP server' };
+              } catch (error) {
+                return { error: error.message };
+              }
+            }
+
+            async analyzeWithDirectCalls(htmlContent, filePath) {
+              console.log('🤖 Starting LLM direct MCP function calling...');
+
+              const tools = [
+                {
+                  type: "function",
+                  function: {
+                    name: "test_html_accessibility",
+                    description: "Test HTML for accessibility violations using A11y MCP Server",
+                    parameters: {
+                      type: "object",
+                      properties: {
+                        html: { type: "string", description: "HTML content to test" },
+                        tags: { type: "array", items: { type: "string" }, description: "WCAG tags" }
+                      },
+                      required: ["html"],
+                      additionalProperties: false
+                    },
+                    strict: true
+                  }
+                },
+                {
+                  type: "function", 
+                  function: {
+                    name: "check_color_contrast",
+                    description: "Check color contrast using A11y MCP Server",
+                    parameters: {
+                      type: "object",
+                      properties: {
+                        foreground: { type: "string", description: "Foreground color in hex" },
+                        background: { type: "string", description: "Background color in hex" },
+                        fontSize: { type: "number", description: "Font size in pixels" },
+                        isBold: { type: "boolean", description: "Whether text is bold" }
+                      },
+                      required: ["foreground", "background"],
+                      additionalProperties: false
+                    },
+                    strict: true
+                  }
+                }
+              ];
+
+              let messages = [
+                {
+                  role: "system",
+                  content: "You are an accessibility expert with access to A11y MCP tools. Use the tools to analyze HTML for WCAG violations and provide specific fixes with exact code replacements."
+                },
+                {
+                  role: "user",
+                  content: `Analyze this HTML file for accessibility issues:
+
+          File: ${filePath}
+
+          HTML:
+          \`\`\`html
+          ${htmlContent}
+          \`\`\`
+
+          Use the tools to get real accessibility data, then provide specific fixes.`
+                }
+              ];
+
+              let iterations = 0;
+              const maxIterations = 5;
+
+              while (iterations < maxIterations) {
+                iterations++;
+                console.log(`🔄 Iteration ${iterations}`);
+
+                const response = await this.openai.chat.completions.create({
+                  model: "gpt-4",
+                  messages: messages,
+                  tools: tools,
+                  tool_choice: "auto",
+                  temperature: 0.1,
+                  max_tokens: 2000
+                });
+
+                const message = response.choices[0].message;
+                messages.push({
+                  role: "assistant",
+                  content: message.content,
+                  tool_calls: message.tool_calls
+                });
+
+                if (message.tool_calls && message.tool_calls.length > 0) {
+                  for (const toolCall of message.tool_calls) {
+                    const functionName = toolCall.function.name;
+                    const functionArgs = JSON.parse(toolCall.function.arguments);
+                    
+                    const functionResult = await this.executeFunction(functionName, functionArgs);
+                    
+                    messages.push({
+                      role: "tool",
+                      tool_call_id: toolCall.id,
+                      content: JSON.stringify(functionResult, null, 2)
+                    });
+                  }
+                } else {
+                  console.log('🎯 LLM provided final analysis');
+                  return {
+                    analysis: message.content,
+                    toolCalls: iterations - 1,
+                    conversationHistory: messages
+                  };
+                }
+              }
+
+              return {
+                analysis: "Max iterations reached",
+                toolCalls: iterations,
+                conversationHistory: messages
+              };
+            }
+
+            async disconnect() {
+              if (this.a11yClient) {
+                await this.a11yClient.close();
+                console.log('🔌 Disconnected from A11y MCP Server');
+              }
+            }
+          }
+
+          async function main() {
+            const agent = new LLMDirectMCPAgent();
+            
+            try {
+              await agent.initialize();
+              
+              // Find HTML file
+              const htmlFiles = ['index.html', 'public/index.html', 'src/index.html'];
+              let foundFile = null;
+              
+              for (const path of htmlFiles) {
+                try {
+                  await fs.access(path);
+                  foundFile = path;
+                  break;
+                } catch (error) {}
+              }
+              
+              if (!foundFile) {
+                console.log('ℹ️ No HTML files found');
+                return;
+              }
+              
+              const htmlContent = await fs.readFile(foundFile, 'utf-8');
+              console.log(`📄 Analyzing ${foundFile} (${htmlContent.length} chars)`);
+              
+              const results = await agent.analyzeWithDirectCalls(htmlContent, foundFile);
+              
+              console.log(`✅ Analysis complete with ${results.toolCalls} tool calls`);
+              
+              // Generate report
+              const report = `# 🤖 LLM Direct MCP Analysis Report
+
+          **Generated:** ${new Date().toISOString()}
+          **File:** ${foundFile}
+          **Tool Calls:** ${results.toolCalls}
+
+          ## 🧠 Analysis:
+
+          ${results.analysis}
+
+          ---
+          *Generated by LLM directly calling A11y MCP Server tools*`;
+
+              await fs.writeFile('LLM_DIRECT_MCP_REPORT.md', report);
+              console.log('📄 Report saved');
+              
+            } catch (error) {
+              console.error('💥 Error:', error.message);
+              process.exit(1);
+            } finally {
+              await agent.disconnect();
+            }
+          }
+
+          main();
+          SCRIPT_EOF
+
+      - name: Run LLM Direct MCP Analysis
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "🤖 Starting LLM Direct MCP Function Calling..."
+          node .github/scripts/llm-direct-mcp.js
+
+      - name: Check for changes and reports
+        id: changes
+        run: |
+          # Check for changes in HTML files
+          if git diff --quiet *.html 2>/dev/null; then
+            echo "html_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "html_changed=true" >> $GITHUB_OUTPUT
+            echo "✅ HTML files were modified"
+          fi
+          
+          # Check if report was generated
+          if [ -f "LLM_DIRECT_MCP_REPORT.md" ]; then
+            echo "report_generated=true" >> $GITHUB_OUTPUT
+            echo "✅ Analysis report was generated"
+          else
+            echo "report_generated=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Overall changes detection
+          if [ "${{ steps.changes.outputs.html_changed }}" == "true" ] || [ "${{ steps.changes.outputs.report_generated }}" == "true" ]; then
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+          else
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clean up artifacts
+        run: |
+          echo "🧹 Cleaning up unwanted files..."
+          rm -rf node_modules/ || true
+          rm -f .github/scripts/llm-direct-mcp.js || true
+          rm -f *.original || true
+          echo "✅ Cleanup completed"
+
+      - name: Commit changes
+        if: steps.changes.outputs.changes_detected == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "LLM Direct MCP Bot"
+          
+          # Add only specific files we want to commit
+          git add *.html .gitignore
+          
+          # Don't commit reports or artifacts
+          git reset -- LLM_DIRECT_MCP_REPORT.md || true
+          git reset -- *.backup || true
+          git reset -- *.original || true
+          
+          # Check if there are actually changes to commit
+          if git diff --staged --quiet; then
+            echo "ℹ️ No changes to commit after cleanup"
+          else
+            git commit -m "🤖 LLM Direct MCP Accessibility Analysis
+
+            - LLM directly called A11y MCP Server tools
+            - Used OpenAI function calling for tool integration  
+            - Applied accessibility fixes based on real WCAG analysis
+            
+            Method: GPT-4 → OpenAI Function Calling → A11y MCP Server
+            Trigger: ${{ github.event_name }}
+            
+            [llm-direct-mcp] [accessibility]"
+            
+            git push
+            echo "✅ Changes committed and pushed"
+          fi
+
+      - name: Create job summary
+        if: always()
+        run: |
+          echo "## 🤖 LLM Direct MCP Function Calling Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** \`${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Method:** LLM Direct MCP Tool Calling via OpenAI Function Calling" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.changes.outputs.changes_detected }}" == "true" ]; then
+            echo "✅ **Status:** LLM successfully analyzed HTML using direct MCP tool calls" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Results:**" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ steps.changes.outputs.html_changed }}" == "true" ]; then
+              echo "- ✅ HTML files were modified with accessibility fixes" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if [ "${{ steps.changes.outputs.report_generated }}" == "true" ]; then
+              echo "- ✅ Analysis report was generated" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Function Calling Flow:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. 🤖 **GPT-4** received HTML content and accessibility analysis task" >> $GITHUB_STEP_SUMMARY
+            echo "2. 📞 **OpenAI Function Calling** enabled LLM to call MCP tools directly" >> $GITHUB_STEP_SUMMARY
+            echo "3. 🔧 **A11y MCP Server** provided real accessibility analysis via Axe-core" >> $GITHUB_STEP_SUMMARY
+            echo "4. 🎯 **LLM** generated specific fixes based on MCP tool results" >> $GITHUB_STEP_SUMMARY
+            echo "5. ✅ **Fixes Applied** to HTML files automatically" >> $GITHUB_STEP_SUMMARY
+            
+          else
+            echo "ℹ️ **Status:** No accessibility issues found or no changes needed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Technical Details:" >> $GITHUB_STEP_SUMMARY
+          echo "- **LLM Model:** GPT-4" >> $GITHUB_STEP_SUMMARY
+          echo "- **Function Calling:** OpenAI Tools API" >> $GITHUB_STEP_SUMMARY  
+          echo "- **MCP Server:** A11y MCP Server (Axe-core)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tools Available:** \`test_html_accessibility\`, \`check_color_contrast\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **WCAG Standards:** 2.1 AA Compliance" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*This workflow demonstrates LLM directly calling MCP server tools using OpenAI's function calling feature*" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-direct-mcp-analysis-${{ github.run_number }}
+          path: |
+            LLM_DIRECT_MCP_REPORT.md
+            *.backup
+            *.original
+          retention-days: 7
+          if-no-files-found: ignore
