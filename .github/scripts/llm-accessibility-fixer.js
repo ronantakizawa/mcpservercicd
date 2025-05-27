@@ -1,4 +1,3 @@
-// .github/scripts/llm-accessibility-fixer.js
 import fs from 'fs/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
